@@ -1,0 +1,125 @@
+// mdns — a DNS resolver in pure Mere over raw UDP.
+//
+// Companion to mhttp (TCP client): the first use of the UDP FFI
+// (udp_open / udp_send / udp_recv, added for this program). It builds a
+// DNS query packet BYTE BY BYTE in the flat arena, sends one datagram to
+// a resolver, and parses the answer section — the same binary-packet
+// construction and length-prefixed parsing as a gzip block, but on the
+// wire. Resolves A (IPv4) records; prints them as dotted quads.
+//
+// Native only (the UDP + flat-arena FFI is C-backend):
+//   mere -c mdns.mere > md.c && clang -O2 md.c -o mdns
+//   ./mdns example.com            # uses 8.8.8.8:53
+//   ./mdns example.com 1.1.1.1
+//
+// Verified against `dig +short <name>` (same A-record set).
+
+extern fn udp_open: str -> int -> int;
+extern fn udp_send: int -> int -> int -> int;
+extern fn udp_recv: int -> int -> int -> int;
+extern fn tcp_close: int -> unit;
+extern fn tcp_set_timeout: int -> int -> int;
+extern fn mem_alloc: int -> int;
+extern fn mem_set_u8: int -> int -> int -> int;
+extern fn mem_get_u8: int -> int -> int;
+extern fn mem_set_u16be: int -> int -> int -> int;
+extern fn mem_get_u16be: int -> int -> int;
+
+// ---- build a standard A-record query into buf; return its length -------
+// Header (12 bytes): id=0x1234, flags=0x0100 (RD), qd=1, an/ns/ar=0.
+let put_header = fn (buf: int) ->
+  let _ = mem_set_u16be buf 0 4660 in       // id 0x1234
+  let _ = mem_set_u16be buf 2 256 in        // flags 0x0100 = recursion desired
+  let _ = mem_set_u16be buf 4 1 in          // QDCOUNT
+  let _ = mem_set_u16be buf 6 0 in          // ANCOUNT
+  let _ = mem_set_u16be buf 8 0 in          // NSCOUNT
+  let _ = mem_set_u16be buf 10 0 in         // ARCOUNT
+  12;
+
+// QNAME: for each dot-separated label, one length byte then the bytes,
+// terminated by a 0 length byte. Returns the offset after QNAME.
+let put_qname = fn (buf: int) -> fn (off: int) -> fn (name: str) ->
+  let n = str_len name in
+  // write label [start, end) at position `at`, preceded by its length
+  let rec emit_label = fn (start: int) -> fn (at: int) ->
+    // find end of this label (next '.' or end of string)
+    let rec find_dot = fn (j: int) ->
+      if j >= n || ord (char_at name j) == 46 then j else find_dot (j + 1) in
+    let stop = find_dot start in
+    let len = stop - start in
+    let _ = mem_set_u8 buf at len in
+    let rec copy = fn (k: int) ->
+      if k >= len then () else
+        let _ = mem_set_u8 buf (at + 1 + k) (ord (char_at name (start + k))) in
+        copy (k + 1) in
+    let _ = copy 0 in
+    let next_at = at + 1 + len in
+    if stop >= n then next_at            // done; caller writes the 0 terminator
+    else emit_label (stop + 1) next_at in
+  let after = emit_label 0 off in
+  let _ = mem_set_u8 buf after 0 in      // root label
+  after + 1;
+
+let build_query = fn (buf: int) -> fn (name: str) ->
+  let off = put_header buf in
+  let off = put_qname buf off name in
+  let _ = mem_set_u16be buf off 1 in         // QTYPE = A
+  let _ = mem_set_u16be buf (off + 2) 1 in   // QCLASS = IN
+  off + 4;
+
+// ---- parse the answer ---------------------------------------------------
+// skip a (possibly compressed) name starting at `off`; return the offset
+// just after it. A pointer (top two bits set) is a 2-byte jump we don't
+// follow — we only need to step PAST the name in the record stream.
+let rec skip_name = fn (buf: int) -> fn (off: int) ->
+  let len = mem_get_u8 buf off in
+  if len == 0 then off + 1
+  else if len >= 192 then off + 2            // 0xC0 compression pointer
+  else skip_name buf (off + 1 + len);
+
+// walk `ancount` answer RRs from `off`; print each A record's IPv4.
+let rec parse_answers = fn (buf: int) -> fn (off: int) -> fn (k: int) -> fn (found: int) ->
+  if k <= 0 then found
+  else
+    let off = skip_name buf off in
+    let rtype = mem_get_u16be buf off in
+    let rdlen = mem_get_u16be buf (off + 8) in
+    let rdata = off + 10 in
+    let found =
+      if rtype == 1 && rdlen == 4 then          // A record, IPv4
+        let a = mem_get_u8 buf rdata in
+        let b = mem_get_u8 buf (rdata + 1) in
+        let c = mem_get_u8 buf (rdata + 2) in
+        let d = mem_get_u8 buf (rdata + 3) in
+        let _ = print (str_of_int a ++ "." ++ str_of_int b ++ "."
+                       ++ str_of_int c ++ "." ++ str_of_int d) in
+        found + 1
+      else found in
+    parse_answers buf (rdata + rdlen) (k - 1) found;
+
+let resolve = fn (name: str) -> fn (server: str) ->
+  let fd = udp_open server 53 in
+  if fd < 0 then (0 - 1)
+  else
+    let _ = tcp_set_timeout fd 3000 in
+    let buf = mem_alloc 65536 in
+    let qlen = build_query buf name in
+    let _ = udp_send fd buf qlen in
+    let n = udp_recv fd buf 65536 in
+    let _ = tcp_close fd in
+    if n < 12 then (0 - 1)
+    else
+      let ancount = mem_get_u16be buf 6 in
+      // answer section starts right after the (single) echoed question
+      let qend = build_query buf name in       // query layout is deterministic
+      parse_answers buf qend ancount 0;
+
+let demo = fn () ->
+  match args () with
+  | Cons (name, rest) ->
+    let server = match rest with Cons (s, _) -> s | Nil -> "8.8.8.8" in
+    let found = resolve name server in
+    if found < 0 then let _ = print "resolve failed" in ()
+    else let _ = print ("(" ++ str_of_int found ++ " A record(s))") in ()
+  | Nil -> let _ = print "usage: mdns <name> [resolver-ip]" in () in
+demo ()
