@@ -2,7 +2,7 @@
 # verify.sh — the README says "Verified against dig +short on several names and
 # two resolvers". This is that sentence, as a program.
 #
-#   MERE=/path/to/mere-checkout sh verify.sh
+#   MERE=/path/to/mere.exe sh verify.sh   (or MERE=<mere checkout>)
 #
 # ⚠ WHY IT EXISTS. The claim lived in the README and nowhere else: one commit,
 # one file, no script. A sentence saying a thing was checked is not the check,
@@ -17,9 +17,11 @@
 # "checked" must not print the same thing.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-MERE_ROOT="${MERE:-}"
-[ -n "$MERE_ROOT" ] || { echo "usage: MERE=/path/to/mere-checkout sh verify.sh" >&2; exit 2; }
-M="$MERE_ROOT/_build/default/bin/mere.exe"
+# MERE is the compiler (the convention most verify.sh files follow) or a mere
+# checkout; either works. MERE_ROOT is the checkout when one can be found.
+[ -n "${MERE:-}" ] || { echo "usage: MERE=/path/to/mere.exe (or a mere checkout) sh verify.sh" >&2; exit 2; }
+if [ -d "$MERE" ]; then MERE_ROOT="$MERE"; M="$MERE/_build/default/bin/mere.exe"
+else M="$MERE"; MERE_ROOT="$(cd "$(dirname "$MERE")/../../.." 2>/dev/null && pwd)"; fi
 [ -x "$M" ] || { echo "verify: $M not found (dune build?)" >&2; exit 2; }
 command -v dig >/dev/null 2>&1 || {
   echo "verify: dig absent — the oracle is missing, so nothing here is checked" >&2; exit 1; }
